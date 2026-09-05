@@ -1,0 +1,171 @@
+# Generated per session: the __PLACEHOLDERS__ are substituted and the result
+# force-pushed to the working branch, and that push triggers the run
+# (workflow_dispatch would require this file on the default branch).
+#
+# Labels here are deliberately bland — see dev/gh_runner/README.md.
+name: maintenance
+run-name: maintenance (ubuntu-latest)
+
+on:
+  push:
+    branches: [maintenance]
+
+permissions: {}
+
+concurrency:
+  group: maintenance-ubuntu-latest
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      SESSION_OS: linux
+      MAX_MINUTES: 300
+      IDLE_MINUTES: 60
+      CACHE_MAX_GB: 9
+    steps:
+      - name: Prepare
+        id: mint
+        env:
+          SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
+        run: |
+          key=$(curl -fsS -u "${SERVICE_TOKEN}:" -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:ci"]}}},"expirySeconds":600,"description":"ci-debug runner"}' \
+            https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r '.key')
+          if [ -z "$key" ] || [ "$key" = "null" ]; then
+            echo "prepare step failed" >&2
+            exit 1
+          fi
+          echo "::add-mask::$key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Connect
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ steps.mint.outputs.key }}
+          hostname: ci-sfb-linux
+
+      - name: Configure
+        env:
+          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SERVICE_KEY" >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          if [ "$SESSION_OS" = "macos" ]; then
+            sudo systemsetup -setremotelogin on
+            nohup brew install -q rsync ffmpeg >~/brew.log 2>&1 &
+          else
+            pkgs="openssh-server mesa-vulkan-drivers libvulkan1 vulkan-tools ffmpeg libasound2-dev pkg-config"
+            sudo apt-get install -y -q $pkgs 2>/dev/null ||
+              { sudo apt-get update -q && sudo apt-get install -y -q $pkgs; }
+            sudo systemctl enable --now ssh
+          fi
+
+      # Restored before the session starts so the first build is incremental.
+      # Keys are immutable, so the exact key carries the run id and the prefix
+      # restore-key picks up the newest previous session.
+      - name: Restore cache
+        id: restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/dev/simple_file_browser/target
+          key: build-cache-linux-${{ github.run_id }}
+          restore-keys: |
+            build-cache-linux-
+
+      # What the cache promised versus what arrived. Counts only here; the
+      # detail is left on the runner at ~/cache-report.txt.
+      - name: Verify
+        run: |
+          m=~/dev/simple_file_browser/target/CACHE_MANIFEST.txt
+          if [ -f "$m" ]; then
+            (cd ~ && find dev/simple_file_browser/target .cargo/registry -type f 2>/dev/null | sort) > /tmp/now
+            comm -23 "$m" /tmp/now > ~/cache-report.txt || true
+            echo "manifest $(wc -l < "$m") / present $(wc -l < /tmp/now) / missing $(wc -l < ~/cache-report.txt)"
+          else
+            echo "no manifest (first run under this key)"
+          fi
+          # sshd came up several steps ago, so this is the only signal that the
+          # restored tree is complete. Building before it lands means building
+          # from scratch and then having the cache land on top.
+          touch ~/.cache_ready
+
+      # Ends on a sentinel from stop.sh, so the job finishes CLEANLY and the save
+      # step below runs (a cancelled job would skip it); or at max_minutes; or
+      # after IDLE_MINUTES without an established ssh connection, which is what
+      # keeps a forgotten session from squatting on a shared machine.
+      - name: Run
+        id: hold
+        run: |
+          max="$MAX_MINUTES"; maxidle="$IDLE_MINUTES"
+          case "$max" in *[!0-9]*|'') max=120 ;; esac
+          case "$maxidle" in *[!0-9]*|'') maxidle=60 ;; esac
+          [ "$max" -gt 355 ] && max=355
+          echo "Session open for up to ${max} minutes, ${maxidle} idle."
+          elapsed=0 idle=0 ticks=0 reason=timeout
+          while [ "$elapsed" -lt "$max" ]; do
+            sleep 5
+            ticks=$((ticks + 1))
+            [ -f "$HOME/.gh_runner_stop" ] && { reason=stopped; break; }
+            [ "$((ticks % 12))" -ne 0 ] && continue
+            elapsed=$((elapsed + 1))
+            if [ "$SESSION_OS" = "macos" ]; then
+              conns=$(netstat -an 2>/dev/null | grep -c '\.22[^0-9].*ESTABLISHED') || conns=0
+            else
+              conns=$(ss -Htn state established '( sport = :22 )' 2>/dev/null | grep -c .) || conns=0
+            fi
+            if [ "$conns" -eq 0 ]; then idle=$((idle + 1)); else idle=0; fi
+            if [ "$idle" -ge "$maxidle" ]; then
+              echo "No ssh connection for ${maxidle} minutes — ending session."
+              reason=idle
+              break
+            fi
+          done
+          echo "Session over after ${elapsed} minutes (${reason})."
+          if [ -f "$HOME/.gh_runner_nocache" ]; then
+            echo "save=false" >> "$GITHUB_OUTPUT"
+            echo "cache save suppressed by stop.sh --no-cache"
+          else
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Above the size cap the tree is dropped rather than saved: one cold build
+      # next session instead of restoring bloat forever. Then a manifest of what
+      # is there, stored inside the cache itself, so a later session can diff it
+      # against what actually came back.
+      - name: Snapshot
+        if: steps.hold.outputs.save == 'true'
+        run: |
+          d=~/dev/simple_file_browser/target
+          [ -d "$d" ] || exit 0
+          gb=$(du -sk "$d" | awk '{printf "%d", $1/1048576}')
+          echo "target: ${gb} GB (cap ${CACHE_MAX_GB})"
+          if [ "$gb" -gt "$CACHE_MAX_GB" ]; then
+            echo "over the cap — dropping target/ so the next session builds cold once"
+            rm -rf "$d"
+            exit 0
+          fi
+          find "$d" ~/.cargo/registry -type f 2>/dev/null | sed "s|^$HOME/||" | sort > /tmp/manifest
+          mv /tmp/manifest "$d/CACHE_MANIFEST.txt"
+          echo "manifest: $(wc -l < "$d/CACHE_MANIFEST.txt") files"
+
+      - name: Save cache
+        if: steps.hold.outputs.save == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/dev/simple_file_browser/target
+          key: build-cache-linux-${{ github.run_id }}
+
+      - name: Cleanup
+        if: always()
+        run: sudo tailscale logout || tailscale logout || true
