@@ -151,6 +151,7 @@ jobs:
           [ "$max" -gt 355 ] && max=355
           echo "Session open for up to ${max} minutes."
           ready=$(date +%s); reason=timeout; elapsed=0
+          echo $((ready + max * 60)) > "$HOME/.ghr_deadline"
           while :; do
             sleep 5
             if [ -f "$HOME/.gh_runner_stop" ]; then
