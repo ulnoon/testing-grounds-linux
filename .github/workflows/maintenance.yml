@@ -1,30 +1,70 @@
-# Generated per session: the __PLACEHOLDERS__ are substituted and the result
-# force-pushed to the working branch, and that push triggers the run
-# (workflow_dispatch would require this file on the default branch).
-#
-# Labels here are deliberately bland — see dev/gh_runner/README.md.
+# Lives on the scratch repo's default branch (ghr keeps it current); every
+# instance is one workflow_dispatch of it with its inputs. Every run sits on the
+# default branch, which is what lets the build cache carry from one instance to
+# the next: an Actions cache is visible only to runs of its own branch or the
+# default branch. Labels here are deliberately bland, see dev/gh_runner/README.md.
 name: maintenance
-run-name: maintenance (ubuntu-latest)
+run-name: maintenance ${{ inputs.id }}
 
 on:
-  push:
-    branches: [maintenance]
+  workflow_dispatch:
+    inputs:
+      id:
+        description: instance
+        required: true
+        type: string
+      image:
+        description: runner image
+        required: true
+        type: string
+      os:
+        description: linux or macos
+        required: true
+        type: string
+      project:
+        description: project directory
+        required: true
+        type: string
+      hostname:
+        description: tailnet hostname
+        required: true
+        type: string
+      cache_key:
+        description: cache namespace
+        required: true
+        type: string
+      max_minutes:
+        description: hard cap
+        required: false
+        type: string
+        default: "180"
+      cache_max_gb:
+        description: tree size cap for the save
+        required: false
+        type: string
+        default: "24"
+      daemon_grace:
+        description: minutes to wait for the daemon
+        required: false
+        type: string
+        default: "20"
 
 permissions: {}
 
 concurrency:
-  group: maintenance-ubuntu-latest
+  group: maintenance-${{ inputs.id }}
   cancel-in-progress: false
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.image }}
     timeout-minutes: 360
     env:
-      SESSION_OS: linux
-      MAX_MINUTES: 90
-      IDLE_MINUTES: 30
-      CACHE_MAX_GB: 9
+      SESSION_OS: ${{ inputs.os }}
+      PROJECT: ${{ inputs.project }}
+      MAX_MINUTES: ${{ inputs.max_minutes }}
+      DAEMON_GRACE: ${{ inputs.daemon_grace }}
+      CACHE_MAX_GB: ${{ inputs.cache_max_gb }}
     steps:
       - name: Prepare
         id: mint
@@ -46,7 +86,7 @@ jobs:
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           authkey: ${{ steps.mint.outputs.key }}
-          hostname: ci-sfb-linux
+          hostname: ${{ inputs.hostname }}
 
       - name: Configure
         env:
@@ -55,8 +95,6 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$SERVICE_KEY" >> ~/.ssh/authorized_keys
           chmod 600 ~/.ssh/authorized_keys
-          # A client that vanished is noticed in ~90 s, so a job whose ssh died
-          # is ended by its watchdog instead of running on for nobody.
           printf 'ClientAliveInterval 30\nClientAliveCountMax 3\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
           if [ "$SESSION_OS" = "macos" ]; then
             sudo systemsetup -setremotelogin on
@@ -68,9 +106,10 @@ jobs:
             sudo systemctl enable --now ssh
           fi
 
-      # Restored before the session starts so the first build is incremental.
-      # Keys are immutable, so the exact key carries the run id and the prefix
-      # restore-key picks up the newest previous session.
+      # The main tree (source + target) and the registry, restored before the
+      # instance opens so the first build is incremental. Keys are immutable, so
+      # the exact key carries the run id and the prefix restore-key picks up the
+      # newest previous instance.
       - name: Restore cache
         id: restore
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -78,80 +117,76 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/dev/simple_file_browser/target
-          key: build-cache-linux-${{ github.run_id }}
+            ~/dev/${{ inputs.project }}
+          key: ${{ inputs.cache_key }}-${{ github.run_id }}
           restore-keys: |
-            build-cache-linux-
+            ${{ inputs.cache_key }}-
 
       # What the cache promised versus what arrived. Counts only here; the
       # detail is left on the runner at ~/cache-report.txt.
       - name: Verify
         run: |
-          m=~/dev/simple_file_browser/target/CACHE_MANIFEST.txt
+          m=~/dev/$PROJECT/CACHE_MANIFEST.txt
           if [ -f "$m" ]; then
-            (cd ~ && find dev/simple_file_browser/target .cargo/registry -type f 2>/dev/null | sort) > /tmp/now
+            (cd ~ && find "dev/$PROJECT" .cargo/registry -type f 2>/dev/null | sort) > /tmp/now
             comm -23 "$m" /tmp/now > ~/cache-report.txt || true
             echo "manifest $(wc -l < "$m") / present $(wc -l < /tmp/now) / missing $(wc -l < ~/cache-report.txt)"
           else
             echo "no manifest (first run under this key)"
           fi
           # sshd came up several steps ago, so this is the only signal that the
-          # restored tree is complete. Building before it lands means building
-          # from scratch and then having the cache land on top.
+          # restored tree is complete.
           touch ~/.cache_ready
 
-      # Ends on a sentinel from stop.sh, so the job finishes CLEANLY and the save
-      # step below runs (a cancelled job would skip it); or at max_minutes; or
-      # after IDLE_MINUTES without an established ssh connection, which is what
-      # keeps a forgotten session from squatting on a shared machine.
+      # Ends on the sentinel the daemon writes (its own activity clock: no job
+      # for IDLE minutes, a stop, or its max), so the job finishes CLEANLY and
+      # the save step runs; or at MAX_MINUTES; or when the daemon's heartbeat
+      # stops; or when no daemon ever arrived within the grace.
       - name: Run
         id: hold
         run: |
-          max="$MAX_MINUTES"; maxidle="$IDLE_MINUTES"
+          max="$MAX_MINUTES"; grace="$DAEMON_GRACE"
           case "$max" in *[!0-9]*|'') max=120 ;; esac
-          case "$maxidle" in *[!0-9]*|'') maxidle=60 ;; esac
+          case "$grace" in *[!0-9]*|'') grace=20 ;; esac
           [ "$max" -gt 355 ] && max=355
-          echo "Session open for up to ${max} minutes, ${maxidle} idle."
-          elapsed=0 idle=0 ticks=0 reason=timeout
-          while [ "$elapsed" -lt "$max" ]; do
+          echo "Session open for up to ${max} minutes."
+          ready=$(date +%s); reason=timeout; elapsed=0
+          while :; do
             sleep 5
-            ticks=$((ticks + 1))
-            [ -f "$HOME/.gh_runner_stop" ] && { reason=stopped; break; }
-            [ "$((ticks % 12))" -ne 0 ] && continue
-            elapsed=$((elapsed + 1))
-            if [ "$SESSION_OS" = "macos" ]; then
-              conns=$(netstat -an 2>/dev/null | grep -c '\.22[^0-9].*ESTABLISHED') || conns=0
-            else
-              conns=$(ss -Htn state established '( sport = :22 )' 2>/dev/null | grep -c .) || conns=0
+            if [ -f "$HOME/.gh_runner_stop" ]; then
+              reason=$(head -1 "$HOME/.gh_runner_stop" 2>/dev/null); reason=${reason:-stopped}; break
             fi
-            if [ "$conns" -eq 0 ]; then idle=$((idle + 1)); else idle=0; fi
-            if [ "$idle" -ge "$maxidle" ]; then
-              echo "No ssh connection for ${maxidle} minutes — ending session."
-              reason=idle
-              break
+            now=$(date +%s); elapsed=$(( (now - ready) / 60 ))
+            [ "$elapsed" -ge "$max" ] && break
+            hb="$HOME/ghr/state/heartbeat"
+            if [ -f "$hb" ]; then
+              beat=$(head -1 "$hb" 2>/dev/null); case "$beat" in *[!0-9]*|'') beat=$now ;; esac
+              [ $((now - beat)) -ge 600 ] && { reason=daemon-dead; break; }
+            elif [ "$elapsed" -ge "$grace" ]; then
+              reason=no-daemon; break
             fi
           done
           echo "Session over after ${elapsed} minutes (${reason})."
           if [ -f "$HOME/.gh_runner_nocache" ]; then
             echo "save=false" >> "$GITHUB_OUTPUT"
-            echo "cache save suppressed by stop.sh --no-cache"
+            echo "cache save suppressed"
           else
             echo "save=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Above the size cap the tree is dropped rather than saved: one cold build
-      # next session instead of restoring bloat forever. Then a manifest of what
-      # is there, stored inside the cache itself, so a later session can diff it
+      # next instance instead of restoring bloat forever. Then a manifest of what
+      # is there, stored inside the cache itself, so a later instance can diff it
       # against what actually came back.
       - name: Snapshot
         if: steps.hold.outputs.save == 'true'
         run: |
-          d=~/dev/simple_file_browser/target
+          d=~/dev/$PROJECT
           [ -d "$d" ] || exit 0
           gb=$(du -sk "$d" | awk '{printf "%d", $1/1048576}')
-          echo "target: ${gb} GB (cap ${CACHE_MAX_GB})"
+          echo "tree: ${gb} GB (cap ${CACHE_MAX_GB})"
           if [ "$gb" -gt "$CACHE_MAX_GB" ]; then
-            echo "over the cap — dropping target/ so the next session builds cold once"
+            echo "over the cap — dropping the tree so the next instance builds cold once"
             rm -rf "$d"
             exit 0
           fi
@@ -166,8 +201,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/dev/simple_file_browser/target
-          key: build-cache-linux-${{ github.run_id }}
+            ~/dev/${{ inputs.project }}
+          key: ${{ inputs.cache_key }}-${{ github.run_id }}
 
       - name: Cleanup
         if: always()
